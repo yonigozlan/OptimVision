@@ -4,34 +4,50 @@ import time
 import requests
 import torch
 from optim_deformable_detr import OptimDeformableDetrForObjectDetection
-from optim_rt_detr import OptimRTDetrForObjectDetection
+
+# from optim_rt_detr import OptimRTDetrForObjectDetection
 from PIL import Image
 
 from transformers import (
     AutoProcessor,
     DeformableDetrForObjectDetection,
     DetrForObjectDetection,
-    RTDetrForObjectDetection,
+)
+from transformers import (
+    OmDetTurboForObjectDetection as OptimOmDetTurboForObjectDetection,
+)
+from transformers import (
+    RTDetrForObjectDetection as OptimRTDetrForObjectDetection,
+)
+from transformers.models.omdet_turbo.modeling_omdet_turbo_baseline import (
+    OmDetTurboForObjectDetection,
 )
 
+# from transformers.models.rt_detr.modeling_rt_detr_baseline import (
+#     RTDetrForObjectDetection,
+# )
 IMAGE_SIZE = (640, 640)
-MANUAL_INFERENCE_STEPS = 100
+MANUAL_INFERENCE_STEPS = 1000
 
-MODEL_NAMES_MODEL_CORRENSPONDENCE = {
-    "rt_detr": RTDetrForObjectDetection,
+MODEL_NAMES_MODEL_CORRESPONDENCE = {
+    # "rt_detr": RTDetrForObjectDetection,
     "optim_rt_detr": OptimRTDetrForObjectDetection,
     "deformable_detr": DeformableDetrForObjectDetection,
     "optim_deformable_detr": OptimDeformableDetrForObjectDetection,
     "detr": DetrForObjectDetection,
+    "omdet_turbo": OmDetTurboForObjectDetection,
+    "optim_omdet_turbo": OptimOmDetTurboForObjectDetection,
 }
 
 
 MODEL_NAMES_WEIGHTS_CORRESPONDENCE = {
-    "rt_detr": "PekingU/rtdetr_r50vd_coco_o365",
-    "optim_rt_detr": "PekingU/rtdetr_r50vd_coco_o365",
+    "rt_detr": "PekingU/rtdetr_r101vd",
+    "optim_rt_detr": "PekingU/rtdetr_r101vd",
     "deformable_detr": "SenseTime/deformable-detr",
     "optim_deformable_detr": "SenseTime/deformable-detr",
     "detr": "facebook/detr-resnet-50",
+    "omdet_turbo": "../omdet-turbo-tiny-timm",
+    "optim_omdet_turbo": "../omdet-turbo-tiny-timm",
 }
 
 
@@ -42,18 +58,23 @@ def get_sample_input_image():
     return image
 
 
-def benchmark_model(model, processor, model_name, experiment):
+def benchmark_model(model, processor, model_name, experiment, dtype=torch.float32):
     image = get_sample_input_image()
-    inputs = processor(images=image, return_tensors="pt", size=IMAGE_SIZE).to("cuda")
+    inputs = processor(
+        images=image,
+        text=["person", "ball", "shoe"],
+        return_tensors="pt",
+        size=IMAGE_SIZE,
+    ).to("cuda", dtype=dtype)
 
     outputs = None
     results = None
-    # Sequential pytorch/tensorboard profiling
+    # pytorch/tensorboard profiling
     with torch.profiler.profile(
         schedule=torch.profiler.schedule(wait=2, warmup=3, active=5, repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            f"./benchmark/{model_name}",
-            worker_name=f"{experiment}_sequential",
+            f"./log_benchmark/{model_name}",
+            worker_name=f"{experiment}",
         ),
         record_shapes=True,
         profile_memory=True,
@@ -63,81 +84,27 @@ def benchmark_model(model, processor, model_name, experiment):
             for _ in range(10):
                 profiler.step()
                 outputs = model(**inputs)
-                results = processor.post_process_object_detection(
-                    outputs, target_sizes=[image.size[::-1]]
-                )
-
+                outputs[0].cpu()
     del outputs, results
     outputs = None
     results = None
 
-    # Sequential manual profiling
+    # manual profiling
     start_time = time.time()
     with torch.no_grad():
         for _ in range(MANUAL_INFERENCE_STEPS):
             outputs = model(**inputs)
-            results = processor.post_process_object_detection(
-                outputs, target_sizes=[image.size[::-1]]
-            )
+            outputs[0].cpu()
+
     end_time = time.time()
-    average_inference_time_sequential = (end_time - start_time) / MANUAL_INFERENCE_STEPS
-    average_fps_sequential = MANUAL_INFERENCE_STEPS / (end_time - start_time + 1e-6)
+    average_inference_time = (end_time - start_time) / MANUAL_INFERENCE_STEPS
+    average_fps = MANUAL_INFERENCE_STEPS / (end_time - start_time + 1e-6)
 
     del outputs, results
-    outputs = None
-    results = None
-
-    # Only model inferences then all post-processing pytorch/tensorboard profiling
-    outputs_list = []
-    results_list = []
-    with torch.profiler.profile(
-        schedule=torch.profiler.schedule(wait=2, warmup=3, active=5, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            f"./benchmark/{model_name}",
-            worker_name=f"{experiment}_split",
-        ),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-    ) as profiler:
-        with torch.no_grad():
-            for _ in range(MANUAL_INFERENCE_STEPS):
-                profiler.step()
-                outputs = model(**inputs)
-                outputs_list.append(outputs)
-        for output in outputs_list:
-            results = processor.post_process_object_detection(
-                output, target_sizes=[image.size[::-1]]
-            )
-            results_list.append(results)
-
-    del outputs, results
-    outputs = None
-    results_list = None
-
-    # All model inferences then all post-processing manual profiling
-    outputs_list = []
-    results_list = []
-    start_time = time.time()
-    with torch.no_grad():
-        for _ in range(MANUAL_INFERENCE_STEPS):
-            outputs = model(**inputs)
-            outputs_list.append(outputs)
-    for output in outputs_list:
-        results = processor.post_process_object_detection(
-            output, target_sizes=[image.size[::-1]]
-        )
-        results_list.append(results)
-    end_time = time.time()
-
-    average_inference_time_split = (end_time - start_time) / MANUAL_INFERENCE_STEPS
-    average_fps__split = MANUAL_INFERENCE_STEPS / (end_time - start_time + 1e-6)
 
     return (
-        average_inference_time_sequential,
-        average_fps_sequential,
-        average_inference_time_split,
-        average_fps__split,
+        average_inference_time,
+        average_fps,
     )
 
 
@@ -153,7 +120,7 @@ def benchmark(models_to_benchmark):
         ]:
             kwargs = {"disable_custom_kernels": True}
         model = (
-            MODEL_NAMES_MODEL_CORRENSPONDENCE[model_name]
+            MODEL_NAMES_MODEL_CORRESPONDENCE[model_name]
             .from_pretrained(MODEL_NAMES_WEIGHTS_CORRESPONDENCE[model_name], **kwargs)
             .to("cuda")
         )
@@ -161,51 +128,78 @@ def benchmark(models_to_benchmark):
             MODEL_NAMES_WEIGHTS_CORRESPONDENCE[model_name]
         )
         print(f"Benchmarking {model_name}")
-        print("Benchmarking eager model")
+        print("Benchmarking eager model (fp32)")
         (
-            average_inference_time_sequential,
-            average_fps_sequential,
-            average_inference_time_split,
-            average_fps__split,
+            average_inference_time,
+            average_fps,
         ) = benchmark_model(model, processor, model_name, "eager")
-        print(
-            f"Average inference time sequential: {average_inference_time_sequential:.3f} s"
-        )
-        print(f"Average FPS sequential: {average_fps_sequential:.3f}")
-        print(f"Average inference time split: {average_inference_time_split:.3f} s")
-        print(f"Average FPS split: {average_fps__split:.3f}")
+        print(f"Average inference time: {average_inference_time:.3f} s")
+        print(f"Average FPS: {average_fps:.3f}")
         print("\n")
 
         results_dict[model_name] = {
             "eager": {
-                "average_inference_time_sequential": average_inference_time_sequential,
-                "average_fps_sequential": average_fps_sequential,
-                "average_inference_time_split": average_inference_time_split,
-                "average_fps_split": average_fps__split,
+                "average_inference_time": average_inference_time,
+                "average_fps": average_fps,
             }
         }
 
         print("benchmarking compiled model")
         model_compiled = torch.compile(model, mode="reduce-overhead")
         (
-            average_inference_time_sequential,
-            average_fps_sequential,
-            average_inference_time_split,
-            average_fps__split,
+            average_inference_time,
+            average_fps,
         ) = benchmark_model(model_compiled, processor, model_name, "compiled")
-        print(
-            f"Average inference time sequential: {average_inference_time_sequential:.3f} s"
-        )
-        print(f"Average FPS sequential: {average_fps_sequential:.3f}")
-        print(f"Average inference time split: {average_inference_time_split:.3f} s")
-        print(f"Average FPS split: {average_fps__split:.3f}")
+        print(f"Average inference time: {average_inference_time:.3f} s")
+        print(f"Average FPS: {average_fps:.3f}")
         print("\n")
 
         results_dict[model_name]["compiled"] = {
-            "average_inference_time_sequential": average_inference_time_sequential,
-            "average_fps_sequential": average_fps_sequential,
-            "average_inference_time_split": average_inference_time_split,
-            "average_fps__split": average_fps__split,
+            "average_inference_time": average_inference_time,
+            "average_fps": average_fps,
+        }
+        del model_compiled
+
+        print("Benchmarking eager model (fp16)")
+        model = model.to(dtype=torch.float16)
+        (
+            average_inference_time,
+            average_fps,
+        ) = benchmark_model(
+            model, processor, model_name, "eager_fp16", dtype=torch.float16
+        )
+        print(f"Average inference time: {average_inference_time:.3f} s")
+        print(f"Average FPS: {average_fps:.3f}")
+        print("\n")
+
+        results_dict[model_name]["eager_fp16"] = {
+            "average_inference_time": average_inference_time,
+            "average_fps": average_fps,
+        }
+
+        del model
+
+        print("benchmarking compiled model (fp16)")
+        model = (
+            MODEL_NAMES_MODEL_CORRESPONDENCE[model_name]
+            .from_pretrained(MODEL_NAMES_WEIGHTS_CORRESPONDENCE[model_name], **kwargs)
+            .to("cuda")
+            .to(dtype=torch.float16)
+        )
+        model_compiled = torch.compile(model, mode="reduce-overhead")
+        (
+            average_inference_time,
+            average_fps,
+        ) = benchmark_model(
+            model_compiled, processor, model_name, "compiled_fp16", dtype=torch.float16
+        )
+        print(f"Average inference time: {average_inference_time:.3f} s")
+        print(f"Average FPS: {average_fps:.3f}")
+        print("\n")
+
+        results_dict[model_name]["compiled_fp16"] = {
+            "average_inference_time": average_inference_time,
+            "average_fps": average_fps,
         }
 
         if model_name in [
@@ -217,7 +211,7 @@ def benchmark(models_to_benchmark):
             del model_compiled
             del model
             model = (
-                MODEL_NAMES_MODEL_CORRENSPONDENCE[model_name]
+                MODEL_NAMES_MODEL_CORRESPONDENCE[model_name]
                 .from_pretrained(
                     MODEL_NAMES_WEIGHTS_CORRESPONDENCE[model_name],
                     disable_custom_kernels=False,
@@ -226,24 +220,16 @@ def benchmark(models_to_benchmark):
             )
             print("benchmarking eager model with cuda kernel for deformable attention")
             (
-                average_inference_time_sequential,
-                average_fps_sequential,
-                average_inference_time_split,
-                average_fps__split,
+                average_inference_time,
+                average_fps,
             ) = benchmark_model(model, processor, model_name, "eager_custom_kernel")
-            print(
-                f"Average inference time sequential: {average_inference_time_sequential:.3f} s"
-            )
-            print(f"Average FPS sequential: {average_fps_sequential:.3f}")
-            print(f"Average inference time split: {average_inference_time_split:.3f} s")
-            print(f"Average FPS split: {average_fps__split:.3f}")
+            print(f"Average inference time: {average_inference_time:.3f} s")
+            print(f"Average FPS: {average_fps:.3f}")
             print("\n")
 
             results_dict[model_name]["eager_custom_kernel"] = {
-                "average_inference_time_sequential": average_inference_time_sequential,
-                "average_fps_sequential": average_fps_sequential,
-                "average_inference_time_split": average_inference_time_split,
-                "average_fps__split": average_fps__split,
+                "average_inference_time": average_inference_time,
+                "average_fps": average_fps,
             }
 
             print(
@@ -251,26 +237,76 @@ def benchmark(models_to_benchmark):
             )
             model_compiled = torch.compile(model, mode="reduce-overhead")
             (
-                average_inference_time_sequential,
-                average_fps_sequential,
-                average_inference_time_split,
-                average_fps__split,
+                average_inference_time,
+                average_fps,
             ) = benchmark_model(
                 model_compiled, processor, model_name, "compiled_custom_kernel"
             )
-            print(
-                f"Average inference time sequential: {average_inference_time_sequential:.3f} s"
-            )
-            print(f"Average FPS sequential: {average_fps_sequential:.3f}")
-            print(f"Average inference time split: {average_inference_time_split:.3f} s")
-            print(f"Average FPS split: {average_fps__split:.3f}")
+            print(f"Average inference time: {average_inference_time:.3f} s")
+            print(f"Average FPS: {average_fps:.3f}")
             print("\n")
 
             results_dict[model_name]["compiled_custom_kernel"] = {
-                "average_inference_time_sequential": average_inference_time_sequential,
-                "average_fps_sequential": average_fps_sequential,
-                "average_inference_time_split": average_inference_time_split,
-                "average_fps__split": average_fps__split,
+                "average_inference_time": average_inference_time,
+                "average_fps": average_fps,
+            }
+            del model_compiled
+
+            print(
+                "benchmarking eager model with cuda kernel for deformable attention (fp16)"
+            )
+            model = model.to(dtype=torch.float16)
+            (
+                average_inference_time,
+                average_fps,
+            ) = benchmark_model(
+                model,
+                processor,
+                model_name,
+                "eager_custom_kernel_fp16",
+                dtype=torch.float16,
+            )
+            print(f"Average inference time: {average_inference_time:.3f} s")
+            print(f"Average FPS: {average_fps:.3f}")
+            print("\n")
+
+            results_dict[model_name]["eager_custom_kernel_fp16"] = {
+                "average_inference_time": average_inference_time,
+                "average_fps": average_fps,
+            }
+
+            del model
+
+            print(
+                "benchmarking compiled model with cuda kernel for deformable attention (fp16)"
+            )
+            model = (
+                MODEL_NAMES_MODEL_CORRESPONDENCE[model_name]
+                .from_pretrained(
+                    MODEL_NAMES_WEIGHTS_CORRESPONDENCE[model_name],
+                    disable_custom_kernels=False,
+                )
+                .to("cuda")
+                .to(dtype=torch.float16)
+            )
+            model_compiled = torch.compile(model, mode="reduce-overhead")
+            (
+                average_inference_time,
+                average_fps,
+            ) = benchmark_model(
+                model_compiled,
+                processor,
+                model_name,
+                "compiled_custom_kernel_fp16",
+                dtype=torch.float16,
+            )
+            print(f"Average inference time: {average_inference_time:.3f} s")
+            print(f"Average FPS: {average_fps:.3f}")
+            print("\n")
+
+            results_dict[model_name]["compiled_custom_kernel_fp16"] = {
+                "average_inference_time": average_inference_time,
+                "average_fps": average_fps,
             }
 
         del model
@@ -282,16 +318,18 @@ def benchmark(models_to_benchmark):
 if __name__ == "__main__":
     results = benchmark(
         [
-            "detr",
-            "deformable_detr",
-            "optim_deformable_detr",
-            "rt_detr",
-            "optim_rt_detr",
+            # "detr",
+            # "deformable_detr",
+            # "optim_deformable_detr",
+            # "rt_detr",
+            # "optim_rt_detr",
+            "omdet_turbo",
+            "optim_omdet_turbo",
         ]
     )
     # dump to pretty json, limit to 2 decimal places
-    with open("benchmark_results.json", "w") as f:
+    with open("benchmark_results_omdet_turbo.json", "w") as f:
         json.dump(results, f, indent=4, default=lambda x: round(x, 2))
 
     print("Benchmarking done")
-    print("Results saved to benchmark_results.json")
+    print("Results saved to benchmark_results_omdet_turbo.json")

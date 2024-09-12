@@ -4,13 +4,13 @@ import pandas as pd
 import seaborn as sns
 from matplotlib import pyplot as plt
 
-with open("benchmark_results.json", "r") as file:
+with open("benchmark_results_rt_detr.json", "r") as file:
     data = json.load(file)
 
 data_filtered = {}
 for model, versions in data.items():
     data_filtered[model] = {
-        version: perf["average_fps_sequential"] for version, perf in versions.items()
+        version: perf["average_fps"] for version, perf in versions.items()
     }
 
 data = data_filtered
@@ -34,14 +34,14 @@ for container in ax.containers:
 
 # Add labels and title
 plt.xlabel("Models")
-plt.ylabel("Average FPS (Sequential)")
-plt.title("Comparison of Average FPS (Sequential) Across Models and Versions")
+plt.ylabel("Average FPS")
+plt.title("Comparison of Average FPS Across Models and Versions")
 plt.xticks(rotation=45)
 plt.legend(title="Versions")
 
 plt.tight_layout()
 plt.show()
-plt.savefig("benchmark_results.png", dpi=300)
+plt.savefig("benchmark_results_rt_detr.png", dpi=300)
 
 # same but with relative speedup compared to eager version
 # Create a DataFrame for seaborn
@@ -66,4 +66,4 @@ plt.legend(title="Versions")
 
 plt.tight_layout()
 plt.show()
-plt.savefig("benchmark_results_relative.png", dpi=300)
+plt.savefig("benchmark_results_relative_rt_detr.png", dpi=300)

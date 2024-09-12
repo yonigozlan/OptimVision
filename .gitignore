@@ -3,6 +3,8 @@
 # Custom
 log**
 torch_compile_debug
+**.png
+**.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

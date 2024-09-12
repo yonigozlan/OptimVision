@@ -1395,3 +1395,337 @@ class OptimRTDetrForObjectDetection(RTDetrPreTrainedModel):
             enc_outputs_coord_logits=outputs.enc_outputs_coord_logits,
             denoising_meta_values=outputs.denoising_meta_values,
         )
+
+
+class RTDetrMultiheadAttention(nn.Module):
+    """
+    Multi-headed attention from 'Attention Is All You Need' paper.
+
+    Here, we add position embeddings to the queries and keys (as explained in the Deformable DETR paper).
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+        if self.head_dim * num_heads != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
+                f" {num_heads})."
+            )
+        self.scaling = self.head_dim**-0.5
+
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+    def _reshape(self, tensor: torch.Tensor, seq_len: int, batch_size: int):
+        return (
+            tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+    def with_pos_embed(
+        self, tensor: torch.Tensor, position_embeddings: Optional[Tensor]
+    ):
+        return tensor if position_embeddings is None else tensor + position_embeddings
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """Input shape: Batch x Time x Channel"""
+
+        batch_size, target_len, embed_dim = hidden_states.size()
+        # add position embeddings to the hidden states before projecting to queries and keys
+        if position_embeddings is not None:
+            hidden_states_original = hidden_states
+            hidden_states = self.with_pos_embed(hidden_states, position_embeddings)
+
+        # get queries, keys and values
+        query_states = self.q_proj(hidden_states) * self.scaling
+        key_states = self._reshape(self.k_proj(hidden_states), -1, batch_size)
+        value_states = self._reshape(
+            self.v_proj(hidden_states_original), -1, batch_size
+        )
+
+        proj_shape = (batch_size * self.num_heads, -1, self.head_dim)
+        query_states = self._reshape(query_states, target_len, batch_size).view(
+            *proj_shape
+        )
+        key_states = key_states.view(*proj_shape)
+        value_states = value_states.view(*proj_shape)
+
+        source_len = key_states.size(1)
+
+        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+
+        if attn_weights.size() != (batch_size * self.num_heads, target_len, source_len):
+            raise ValueError(
+                f"Attention weights should be of size {(batch_size * self.num_heads, target_len, source_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+
+        # expand attention_mask
+        if attention_mask is not None:
+            # [seq_len, seq_len] -> [batch_size, 1, target_seq_len, source_seq_len]
+            attention_mask = attention_mask.expand(
+                batch_size, 1, *attention_mask.size()
+            )
+
+        if attention_mask is not None:
+            if attention_mask.size() != (batch_size, 1, target_len, source_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(batch_size, 1, target_len, source_len)}, but is"
+                    f" {attention_mask.size()}"
+                )
+            attn_weights = (
+                attn_weights.view(batch_size, self.num_heads, target_len, source_len)
+                + attention_mask
+            )
+            attn_weights = attn_weights.view(
+                batch_size * self.num_heads, target_len, source_len
+            )
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+        if output_attentions:
+            # this operation is a bit awkward, but it's required to
+            # make sure that attn_weights keeps its gradient.
+            # In order to do so, attn_weights have to reshaped
+            # twice and have to be reused in the following
+            attn_weights_reshaped = attn_weights.view(
+                batch_size, self.num_heads, target_len, source_len
+            )
+            attn_weights = attn_weights_reshaped.view(
+                batch_size * self.num_heads, target_len, source_len
+            )
+        else:
+            attn_weights_reshaped = None
+
+        attn_probs = nn.functional.dropout(
+            attn_weights, p=self.dropout, training=self.training
+        )
+
+        attn_output = torch.bmm(attn_probs, value_states)
+
+        if attn_output.size() != (
+            batch_size * self.num_heads,
+            target_len,
+            self.head_dim,
+        ):
+            raise ValueError(
+                f"`attn_output` should be of size {(batch_size, self.num_heads, target_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.view(
+            batch_size, self.num_heads, target_len, self.head_dim
+        )
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(batch_size, target_len, embed_dim)
+
+        attn_output = self.out_proj(attn_output)
+
+        return attn_output, attn_weights_reshaped
+
+
+class OptimRTDetrMultiheadFusedAttention(nn.Module):
+    """
+    Multi-headed attention from 'Attention Is All You Need' paper. Modified from the original implementation
+    to include fused q/k/v projection.
+
+    Here, we add position embeddings to the queries and keys (as explained in the Deformable DETR paper).
+    """
+
+    def __init__(
+        self, embed_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+        if self.head_dim * num_heads != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
+                f" {num_heads})."
+            )
+        self.scaling = self.head_dim**-0.5
+
+        # self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        # self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        # self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        # self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        # fused attention proj
+        total_head_dim = 3 * self.embed_dim
+        self.qkv_proj = nn.Linear(self.hidden_size, total_head_dim, bias=bias)
+
+        # conversion from un-fused to fused
+        self._register_load_state_dict_pre_hook(self.load_hook)
+
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+    def load_hook(self, state_dict, prefix, *args):
+        if prefix + "q_proj.weight" in state_dict:
+            q_proj = state_dict.pop(prefix + "q_proj.weight")
+            k_proj = state_dict.pop(prefix + "k_proj.weight")
+            v_proj = state_dict.pop(prefix + "v_proj.weight")
+            state_dict[prefix + "qkv_proj.weight"] = torch.cat([q_proj, k_proj, v_proj])
+
+            if self.config.attention_bias:
+                q_bias = state_dict.pop(prefix + "q_proj.bias")
+                k_bias = state_dict.pop(prefix + "k_proj.bias")
+                v_bias = state_dict.pop(prefix + "v_proj.bias")
+                state_dict[prefix + "qkv_proj.bias"] = torch.cat(
+                    [q_bias, k_bias, v_bias]
+                )
+
+    def _reshape(self, tensor: torch.Tensor, seq_len: int, batch_size: int):
+        return (
+            tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+    def with_pos_embed(
+        self, tensor: torch.Tensor, position_embeddings: Optional[Tensor]
+    ):
+        return tensor if position_embeddings is None else tensor + position_embeddings
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """Input shape: Batch x Time x Channel"""
+
+        batch_size, target_len, embed_dim = hidden_states.size()
+        # add position embeddings to the hidden states before projecting to queries and keys
+        if position_embeddings is not None:
+            hidden_states_original = hidden_states
+            hidden_states = self.with_pos_embed(hidden_states, position_embeddings)
+
+        # get queries, keys and values
+        query_key_value_states = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = query_key_value_states.split(
+            [self.embed_dim, self.embed_dim, self.embed_dim], dim=-1
+        )
+        # query_states = self.q_proj(hidden_states) * self.scaling
+        # key_states = self._reshape(self.k_proj(hidden_states), -1, batch_size)
+        # value_states = self._reshape(
+        #     self.v_proj(hidden_states_original), -1, batch_size
+        # )
+
+        proj_shape = (batch_size * self.num_heads, -1, self.head_dim)
+        query_states = self._reshape(query_states, target_len, batch_size).view(
+            *proj_shape
+        )
+        key_states = key_states.view(*proj_shape)
+        value_states = value_states.view(*proj_shape)
+
+        source_len = key_states.size(1)
+
+        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+
+        if attn_weights.size() != (batch_size * self.num_heads, target_len, source_len):
+            raise ValueError(
+                f"Attention weights should be of size {(batch_size * self.num_heads, target_len, source_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+
+        # expand attention_mask
+        if attention_mask is not None:
+            # [seq_len, seq_len] -> [batch_size, 1, target_seq_len, source_seq_len]
+            attention_mask = attention_mask.expand(
+                batch_size, 1, *attention_mask.size()
+            )
+
+        if attention_mask is not None:
+            if attention_mask.size() != (batch_size, 1, target_len, source_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(batch_size, 1, target_len, source_len)}, but is"
+                    f" {attention_mask.size()}"
+                )
+            attn_weights = (
+                attn_weights.view(batch_size, self.num_heads, target_len, source_len)
+                + attention_mask
+            )
+            attn_weights = attn_weights.view(
+                batch_size * self.num_heads, target_len, source_len
+            )
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+        if output_attentions:
+            # this operation is a bit awkward, but it's required to
+            # make sure that attn_weights keeps its gradient.
+            # In order to do so, attn_weights have to reshaped
+            # twice and have to be reused in the following
+            attn_weights_reshaped = attn_weights.view(
+                batch_size, self.num_heads, target_len, source_len
+            )
+            attn_weights = attn_weights_reshaped.view(
+                batch_size * self.num_heads, target_len, source_len
+            )
+        else:
+            attn_weights_reshaped = None
+
+        attn_probs = nn.functional.dropout(
+            attn_weights, p=self.dropout, training=self.training
+        )
+
+        attn_output = torch.bmm(attn_probs, value_states)
+
+        if attn_output.size() != (
+            batch_size * self.num_heads,
+            target_len,
+            self.head_dim,
+        ):
+            raise ValueError(
+                f"`attn_output` should be of size {(batch_size, self.num_heads, target_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.view(
+            batch_size, self.num_heads, target_len, self.head_dim
+        )
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(batch_size, target_len, embed_dim)
+
+        attn_output = self.out_proj(attn_output)
+
+        return attn_output, attn_weights_reshaped
+
+
+# def fuse_attention_weights(
+#     model: OptimRTDetrForObjectDetection, device, torch_dtype
+# ) -> OptimRTDetrForObjectDetection:
+#     for idx, layer in tqdm(
+#         enumerate(model.model.layers),
+#         desc="Fusing attention weights",
+#         total=model.config.num_hidden_layers,
+#     ):
+#         state_dict = layer.self_attn.state_dict()
+#         del layer.self_attn
+#         layer.self_attn = Gemma2FusedAttention(model.config, layer_idx=idx)
+#         # convert un-fused to fused through the pre-register hook
+#         layer.self_attn.load_state_dict(state_dict)
+#         layer.self_attn.to(device, dtype=torch_dtype)
+#     return model
