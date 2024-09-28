@@ -3,31 +3,40 @@ import time
 
 import requests
 import torch
-from optim_deformable_detr import OptimDeformableDetrForObjectDetection
 
+# from optim_deformable_detr import OptimDeformableDetrForObjectDetection
 # from optim_rt_detr import OptimRTDetrForObjectDetection
 from PIL import Image
 
 from transformers import (
     AutoProcessor,
-    DeformableDetrForObjectDetection,
     DetrForObjectDetection,
 )
 from transformers import (
-    OmDetTurboForObjectDetection as OptimOmDetTurboForObjectDetection,
+    DeformableDetrForObjectDetection as OptimDeformableDetrForObjectDetection,
 )
+
+# from transformers import (
+#     OmDetTurboForObjectDetection as OptimOmDetTurboForObjectDetection,
+# )
 from transformers import (
     RTDetrForObjectDetection as OptimRTDetrForObjectDetection,
 )
-from transformers.models.omdet_turbo.modeling_omdet_turbo_baseline import (
-    OmDetTurboForObjectDetection,
+from transformers.models.deformable_detr.modeling_deformable_detr_baseline import (
+    DeformableDetrForObjectDetection,
 )
+
+# from transformers.models.omdet_turbo.modeling_omdet_turbo_baseline import (
+#     OmDetTurboForObjectDetection,
+# )
 
 # from transformers.models.rt_detr.modeling_rt_detr_baseline import (
 #     RTDetrForObjectDetection,
 # )
 IMAGE_SIZE = (640, 640)
 MANUAL_INFERENCE_STEPS = 1000
+LOG_DIR = "./log_benchmark_deformable_detr_two_stage"
+OUTPUT_FILE_PATH = "./benchmark_results_deformable_detr_two_stage.json"
 
 MODEL_NAMES_MODEL_CORRESPONDENCE = {
     # "rt_detr": RTDetrForObjectDetection,
@@ -35,8 +44,8 @@ MODEL_NAMES_MODEL_CORRESPONDENCE = {
     "deformable_detr": DeformableDetrForObjectDetection,
     "optim_deformable_detr": OptimDeformableDetrForObjectDetection,
     "detr": DetrForObjectDetection,
-    "omdet_turbo": OmDetTurboForObjectDetection,
-    "optim_omdet_turbo": OptimOmDetTurboForObjectDetection,
+    # "omdet_turbo": OmDetTurboForObjectDetection,
+    # "optim_omdet_turbo": OptimOmDetTurboForObjectDetection,
 }
 
 
@@ -62,9 +71,9 @@ def benchmark_model(model, processor, model_name, experiment, dtype=torch.float3
     image = get_sample_input_image()
     inputs = processor(
         images=image,
-        text=["person", "ball", "shoe"],
+        # text=["person", "ball", "shoe"],
         return_tensors="pt",
-        size=IMAGE_SIZE,
+        # size=IMAGE_SIZE,
     ).to("cuda", dtype=dtype)
 
     outputs = None
@@ -73,7 +82,7 @@ def benchmark_model(model, processor, model_name, experiment, dtype=torch.float3
     with torch.profiler.profile(
         schedule=torch.profiler.schedule(wait=2, warmup=3, active=5, repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            f"./log_benchmark/{model_name}",
+            f"./{LOG_DIR}/{model_name}",
             worker_name=f"{experiment}",
         ),
         record_shapes=True,
@@ -319,17 +328,17 @@ if __name__ == "__main__":
     results = benchmark(
         [
             # "detr",
-            # "deformable_detr",
-            # "optim_deformable_detr",
+            "deformable_detr",
+            "optim_deformable_detr",
             # "rt_detr",
             # "optim_rt_detr",
-            "omdet_turbo",
-            "optim_omdet_turbo",
+            # "omdet_turbo",
+            # "optim_omdet_turbo",
         ]
     )
     # dump to pretty json, limit to 2 decimal places
-    with open("benchmark_results_omdet_turbo.json", "w") as f:
+    with open(OUTPUT_FILE_PATH, "w") as f:
         json.dump(results, f, indent=4, default=lambda x: round(x, 2))
 
     print("Benchmarking done")
-    print("Results saved to benchmark_results_omdet_turbo.json")
+    print(f"Results saved to {OUTPUT_FILE_PATH}")
